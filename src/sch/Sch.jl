@@ -3,6 +3,7 @@ module Sch
 using Distributed
 import MemPool: DRef, poolset
 import Statistics: mean
+import Random: randperm
 
 import ..Dagger
 import ..Dagger: Context, Processor, Thunk, WeakThunk, ThunkFuture, ThunkFailedException, Chunk, OSProc, AnyScope
@@ -414,6 +415,7 @@ function compute_dag(ctx, d::Thunk; options=SchedulerOptions())
 
         isempty(state.running) && continue
         timespan_start(ctx, :take, 0, 0)
+        @debug "Sch: take!"
         chan_value = take!(chan) # get result of completed thunk
         timespan_finish(ctx, :take, 0, 0)
         if chan_value isa RescheduleSignal
@@ -612,6 +614,7 @@ function schedule!(ctx, state, procs=procs_to_use(ctx))
         task = nothing
         @label pop_task
         if task !== nothing
+            #@debug "Sch: finish scheduling ($(task.id))"
             timespan_finish(ctx, :schedule, task.id, (;thunk_id=task.id))
         end
         if isempty(state.ready)
@@ -619,6 +622,7 @@ function schedule!(ctx, state, procs=procs_to_use(ctx))
         end
         task = pop!(state.ready)
         timespan_start(ctx, :schedule, task.id, (;thunk_id=task.id))
+        #@debug "Sch: start scheduling ($(task.id))"
         @assert !haskey(state.cache, task)
         opts = merge(ctx.options, task.options)
         sig = signature(task, state)
@@ -657,20 +661,38 @@ function schedule!(ctx, state, procs=procs_to_use(ctx))
         inputs = filter(t->istask(t)||isa(t,Chunk), unwrap_weak_checked.(task.inputs))
         chunks = [istask(input) ? state.cache[input] : input for input in inputs]
         #local_procs = unique(map(c->c isa Chunk ? processor(c) : OSProc(), chunks))
-        local_procs = vcat([Dagger.get_processors(gp) for gp in procs]...)
+        local_procs = unique(vcat([Dagger.get_processors(gp) for gp in procs]...))
         if length(local_procs) > fallback_threshold
             @goto fallback
         end
         affinities = Dict(proc=>impute_sum([affinity(chunk)[2] for chunk in filter(c->isa(c,Chunk)&&get_parent(processor(c))==get_parent(proc), chunks)]) for proc in local_procs)
         # Estimate cost to move data and get scheduled
         costs = Dict(proc=>state.worker_pressure[get_parent(proc).pid][proc]+(aff/tx_rate) for (proc,aff) in affinities)
+
+        # shuffle procs around
+        P = randperm(length(local_procs))
+        local_procs = getindex.(Ref(local_procs), P)
+
         sort!(local_procs, by=p->costs[p])
         scheduled = false
+
+        # Move our corresponding ThreadProc to be the last considered
+        if length(local_procs) > 1
+            sch_threadproc = Dagger.ThreadProc(myid(), Threads.threadid())
+            sch_thread_idx = findfirst(proc->proc==sch_threadproc, local_procs)
+            if sch_thread_idx !== nothing
+                deleteat!(local_procs, sch_thread_idx)
+                push!(local_procs, sch_threadproc)
+            end
+        end
+
         for proc in local_procs
             gproc = get_parent(proc)
+            @debug "Sch: considering $proc with cost $(costs[proc]) and pressure $(state.worker_pressure[gproc.pid][proc])"
             if can_use_proc(task, gproc, proc, opts, scope)
                 has_cap, cap, extra_util = has_capacity(proc, gproc.pid, opts.procutil, sig)
                 if has_cap
+                    @debug "Sch: accepting $proc"
                     # Schedule task onto proc
                     extra_util = extra_util isa MaxUtilization ? cap : extra_util
                     push!(get!(()->Vector{Tuple{Thunk,<:Any}}(), to_fire, (gproc, proc)), (task, extra_util))
@@ -869,6 +891,7 @@ function fire_tasks!(ctx, thunks::Vector{<:Tuple}, (gproc, proc), state)
     to_send = []
     for (thunk, util) in thunks
         push!(state.running, thunk)
+        @debug "Sch: firing ($(thunk.id))"
         state.running_on[thunk] = gproc
         if thunk.cache && thunk.cache_ref !== nothing
             # the result might be already cached
