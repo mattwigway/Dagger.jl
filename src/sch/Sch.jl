@@ -596,13 +596,21 @@ function schedule!(ctx, state, procs=procs_to_use(ctx))
         end
         "Like `sum`, but replaces `nothing` entries with the average of non-`nothing` entries."
         function impute_sum(xs)
-            all(x->!isa(x, Chunk), xs) && return 0
-            avg = round(UInt64, mean(filter(x->x isa Chunk, xs)))
-            total = 0
+            length(xs) == 0 && return 0
+
+            total = zero(eltype(xs))
+            nothing_count = 0
+            something_count = 0
             for x in xs
-                total += x !== nothing ? x : avg
+                if isnothing(x)
+                    nothing_count += 1
+                else
+                    something_count += 1
+                    total += x
+                end
             end
-            total
+
+            total + nothing_count * total / something_count
         end
 
         # Schedule tasks
@@ -666,8 +674,11 @@ function schedule!(ctx, state, procs=procs_to_use(ctx))
             @goto fallback
         end
         affinities = Dict(proc=>impute_sum([affinity(chunk)[2] for chunk in filter(c->isa(c,Chunk)&&get_parent(processor(c))==get_parent(proc), chunks)]) for proc in local_procs)
-        # Estimate cost to move data and get scheduled
-        costs = Dict(proc=>state.worker_pressure[get_parent(proc).pid][proc]+(aff/tx_rate) for (proc,aff) in affinities)
+        # Estimate cost to move data and get scheduled - use convert to avoid underflow if affinity > pressure.
+        # TODO currently using floating-point divide here because tx_rate may be larger than aff (and if we're doing many operations, we'd still prefer to stick
+        # to the worker that has the data, even if it will take <1s to transfer). This might be more efficient with integer divide, but would have to represent tx in
+        # bytes per ms/μs/ns and scale worker_pressure accordingly.
+        costs = Dict(proc=>convert(Int64, state.worker_pressure[get_parent(proc).pid][proc]) - convert(Int64, aff) / convert(Int64, tx_rate) for (proc,aff) in affinities)
 
         # shuffle procs around
         P = randperm(length(local_procs))
